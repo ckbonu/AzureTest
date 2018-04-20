@@ -1,10 +1,12 @@
-package awsiot
+package azureiot
 
 import (
 	"io/ioutil"
 	"testing"
 
+	"github.com/TIBCOSoftware/flogo-contrib/action/flow/test"
 	"github.com/TIBCOSoftware/flogo-lib/core/activity"
+	"github.com/stretchr/testify/assert"
 )
 
 var activityMetadata *activity.Metadata
@@ -32,4 +34,28 @@ func TestCreate(t *testing.T) {
 		t.Fail()
 		return
 	}
+}
+
+func TestEval(t *testing.T) {
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Failed()
+			t.Errorf("panic during execution: %v", r)
+		}
+	}()
+
+	act := NewActivity(getActivityMetadata())
+	tc := test.NewTestActivityContext(getActivityMetadata())
+
+	//setup attrs
+
+	tc.SetInput("connectionString", "HostName=HomeAutoHub.azure-devices.net;DeviceId=raspi;SharedAccessKey=IHx8ac6Bad4vHbv4I0HiJkhgeCNZhuzQdnllCAMSR+o=")
+
+	act.Eval(tc)
+
+	//check result attr
+	result := tc.GetOutput("result")
+	status := tc.GetOutput("status")
+	assert.Equal(t, result, "Trying to connect to device using connection string on Azure IOTHub:HostName=HomeAutoHub.azure-devices.net;DeviceId=raspi;SharedAccessKey=IHx8ac6Bad4vHbv4I0HiJkhgeCNZhuzQdnllCAMSR+o=")
 }

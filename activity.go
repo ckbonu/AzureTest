@@ -1,151 +1,234 @@
-package awsiot
+package azureiot
 
 import (
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/json"
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
+	"html/template"
+	"io"
 	"io/ioutil"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/TIBCOSoftware/flogo-lib/core/activity"
 	"github.com/TIBCOSoftware/flogo-lib/logger"
-
-	MQTT "github.com/eclipse/paho.mqtt.golang"
 )
 
-// log is the default package logger
-var log = logger.GetLogger("activity-tibco-rest")
+var log = logger.GetLogger("activity-azureiot")
 
 const (
-	ivThingName   = "thingName"
-	ivAwsEndpoint = "awsEndpoint"
-	ivDesired     = "desired"
-	ivReported    = "reported"
+	ivconnectionString = "connectionString"
 
 	ovResult = "result"
+	ovStatus = "status"
+
+	maxIdleConnections int    = 100
+	requestTimeout     int    = 10
+	tokenValidSecs     int    = 3600
+	apiVersion         string = "2016-11-14"
 )
 
-// AwsIoT is an Activity that is used to update an Aws IoT device shadow
-// inputs : {method,uri,params}
-// outputs: {result}
-type AwsIoT struct {
+type sharedAccessKey = string
+type sharedAccessKeyName = string
+type hostName = string
+type deviceID = string
+
+// IotHubHTTPClient is a simple client to connect to Azure IoT Hub
+type IotHubHTTPClient struct {
+	sharedAccessKeyName sharedAccessKeyName
+	sharedAccessKey     sharedAccessKey
+	hostName            hostName
+	deviceID            deviceID
+	client              *http.Client
+}
+
+// MyActivity is a stub for your Activity implementation
+type MyActivity struct {
 	metadata *activity.Metadata
 }
 
-// NewActivity creates a new AwsIoT activity
+// NewActivity creates a new activity
 func NewActivity(metadata *activity.Metadata) activity.Activity {
-	return &AwsIoT{metadata: metadata}
+	return &MyActivity{metadata: metadata}
 }
 
-// Metadata returns the activity's metadata
-func (a *AwsIoT) Metadata() *activity.Metadata {
+// Metadata implements activity.Activity.Metadata
+func (a *MyActivity) Metadata() *activity.Metadata {
 	return a.metadata
 }
 
-// Eval implements api.Activity.Eval - Invokes a Aws Iot Shadow Update
-func (a *AwsIoT) Eval(context activity.Context) (done bool, err error) {
+// Eval implements activity.Activity.Eval
+func (a *MyActivity) Eval(context activity.Context) (done bool, err error) {
 
-	thingName := context.GetInput(ivThingName).(string)
-	awsEndpoint := context.GetInput(ivAwsEndpoint).(string)
+	// do eval
 
-	req := &ShadowRequest{State: &ShadowState{}}
+	connectionString := context.GetInput(ivconnectionString).(string)
 
-	if context.GetInput(ivDesired) != nil {
-		desired := context.GetInput(ivDesired).(map[string]string)
-		req.State.Desired = desired
-	}
+	log.Debug("The connection string to device is [%s]", connectionString)
 
-	if context.GetInput(ivReported) != nil {
-		reported := context.GetInput(ivReported).(map[string]string)
-		req.State.Reported = reported
-	}
-
-	reqJSON, err := json.Marshal(req)
-
+	client, err := NewIotHubHTTPClientFromConnectionString(connectionString)
 	if err != nil {
-		return false, activity.NewError(err.Error(), "", nil)
+		log.Error("Error creating http client from connection string", err)
 	}
+	resp, status := client.CreateDeviceID("testing")
 
-	log.Debugf("Shadow Request: %s", string(reqJSON))
-
-	brokerURI := fmt.Sprintf("ssl://%s:%d", awsEndpoint, 8883)
-	log.Debugf("Broker URI: %s", brokerURI)
-
-	tlsConfig := NewTLSConfig(thingName)
-
-	opts := MQTT.NewClientOptions()
-	opts.AddBroker(brokerURI)
-	opts.SetClientID(context.FlowDetails().ID())
-	opts.SetTLSConfig(tlsConfig)
-
-	// Start the connection
-	client := MQTT.NewClient(opts)
-	defer client.Disconnect(250)
-
-	token := client.Connect()
-
-	if token.Wait() && token.Error() != nil {
-		log.Errorf("Error connecting to '%s': %s", brokerURI, token.Error().Error())
-		return false, activity.NewError(token.Error().Error(), "", nil)
-	}
-
-	thingUpdate := fmt.Sprintf("$aws/things/%s/shadow/update", thingName)
-	Publish(client, thingUpdate, 1, string(reqJSON))
-
+	context.SetOutput(ovResult, resp)
+	context.SetOutput(ovStatus, status)
 	return true, nil
 }
-
-////////////////////////////////////////////////////////////////////////////////////////
-// Utils
-
-// Publish publishes a client message
-func Publish(client MQTT.Client, topic string, qos int, input string) error {
-	token := client.Publish(topic, byte(qos), false, input)
-	if token.Wait() && token.Error() != nil {
-		log.Error(token.Error())
-		return token.Error()
-	}
-	return nil
-}
-
-// NewTLSConfig creates a TLS configuration for the specified 'thing'
-func NewTLSConfig(thingName string) *tls.Config {
-	// Import root CA
-	certpool := x509.NewCertPool()
-	pemCerts, err := ioutil.ReadFile("things/root-CA.pem.crt")
-	if err == nil {
-		certpool.AppendCertsFromPEM(pemCerts)
-	}
-
-	thingDir := "things/" + thingName + "/"
-
-	// Import client certificate/key pair for the specified 'thing'
-	cert, err := tls.LoadX509KeyPair(thingDir+"device.pem.crt", thingDir+"device.pem.key")
+func parseConnectionString(connString string) (hostName, sharedAccessKey, sharedAccessKeyName, deviceID, error) {
+	url, err := url.ParseQuery(connString)
 	if err != nil {
-		panic(err)
+		return "", "", "", "", err
 	}
 
-	cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+	h := tryGetKeyByName(url, "HostName")
+	kn := tryGetKeyByName(url, "SharedAccessKeyName")
+	k := tryGetKeyByName(url, "SharedAccessKey")
+	d := tryGetKeyByName(url, "DeviceId")
+
+	return hostName(h), sharedAccessKey(k), sharedAccessKeyName(kn), deviceID(d), nil
+}
+
+func tryGetKeyByName(v url.Values, key string) string {
+	if len(v[key]) == 0 {
+		return ""
+	}
+
+	return strings.Replace(v[key][0], " ", "+", -1)
+}
+
+// NewIotHubHTTPClient is a constructor of IutHubClient
+func NewIotHubHTTPClient(hostName string, sharedAccessKeyName string, sharedAccessKey string, deviceID string) *IotHubHTTPClient {
+	return &IotHubHTTPClient{
+		sharedAccessKeyName: sharedAccessKeyName,
+		sharedAccessKey:     sharedAccessKey,
+		hostName:            hostName,
+		deviceID:            deviceID,
+		client: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: maxIdleConnections,
+			},
+			Timeout: time.Duration(requestTimeout) * time.Second,
+		},
+	}
+}
+
+// NewIotHubHTTPClientFromConnectionString creates new client from connection string
+func NewIotHubHTTPClientFromConnectionString(connectionString string) (*IotHubHTTPClient, error) {
+	h, k, kn, d, err := parseConnectionString(connectionString)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
-	return &tls.Config{
-		RootCAs:            certpool,
-		ClientAuth:         tls.NoClientCert,
-		ClientCAs:          nil,
-		InsecureSkipVerify: true,
-		Certificates:       []tls.Certificate{cert},
+	return NewIotHubHTTPClient(h, kn, k, d), nil
+}
+
+// IsDevice tell either device id was specified when client created.
+// If device id was specified in connection string this will enabled device scoped requests.
+func (c *IotHubHTTPClient) IsDevice() bool {
+	return c.deviceID != ""
+}
+
+// Service API
+
+// CreateDeviceID creates record for for given device identifier in Azure IoT Hub
+func (c *IotHubHTTPClient) CreateDeviceID(deviceID string) (string, string) {
+	url := fmt.Sprintf("%s/devices/%s?api-version=%s", c.hostName, deviceID, apiVersion)
+	data := fmt.Sprintf(`{"deviceId":"%s"}`, deviceID)
+	return c.performRequest("PUT", url, data)
+}
+
+// GetDeviceID retrieves device by id
+func (c *IotHubHTTPClient) GetDeviceID(deviceID string) (string, string) {
+	url := fmt.Sprintf("%s/devices/%s?api-version=%s", c.hostName, deviceID, apiVersion)
+	return c.performRequest("GET", url, "")
+}
+
+// DeleteDeviceID deletes device by id
+func (c *IotHubHTTPClient) DeleteDeviceID(deviceID string) (string, string) {
+	url := fmt.Sprintf("%s/devices/%s?api-version=%s", c.hostName, deviceID, apiVersion)
+	return c.performRequest("DELETE", url, "")
+}
+
+// PurgeCommandsForDeviceID removed commands for specified device
+func (c *IotHubHTTPClient) PurgeCommandsForDeviceID(deviceID string) (string, string) {
+	url := fmt.Sprintf("%s/devices/%s/commands?api-version=%s", c.hostName, deviceID, apiVersion)
+	return c.performRequest("DELETE", url, "")
+}
+
+// ListDeviceIDs list all device ids
+func (c *IotHubHTTPClient) ListDeviceIDs(top int) (string, string) {
+	url := fmt.Sprintf("%s/devices?top=%d&api-version=%s", c.hostName, top, apiVersion)
+	return c.performRequest("GET", url, "")
+}
+
+// TODO: SendMessageToDevice as soon as that endpoint is exposed via HTTP
+
+// Device API
+
+// SendMessage from a logged in device
+func (c *IotHubHTTPClient) SendMessage(message string) (string, string) {
+	url := fmt.Sprintf("%s/devices/%s/messages/events?api-version=%s", c.hostName, c.deviceID, apiVersion)
+	return c.performRequest("POST", url, message)
+}
+
+// ReceiveMessage to a logged in device
+func (c *IotHubHTTPClient) ReceiveMessage(HubInput string) (string, string) {
+	url := fmt.Sprintf("%s/devices/%s/messages/deviceBound?api-version=%s", c.hostName, c.deviceID, apiVersion)
+	return c.performRequest("GET", url, HubInput)
+}
+
+func (c *IotHubHTTPClient) buildSasToken(uri string) string {
+	timestamp := time.Now().Unix() + int64(3600)
+	encodedURI := template.URLQueryEscaper(uri)
+
+	toSign := encodedURI + "\n" + strconv.FormatInt(timestamp, 10)
+
+	binKey, _ := base64.StdEncoding.DecodeString(c.sharedAccessKey)
+	mac := hmac.New(sha256.New, []byte(binKey))
+	mac.Write([]byte(toSign))
+
+	encodedSignature := template.URLQueryEscaper(base64.StdEncoding.EncodeToString(mac.Sum(nil)))
+
+	if c.sharedAccessKeyName != "" {
+		return fmt.Sprintf("SharedAccessSignature sig=%s&se=%d&skn=%s&sr=%s", encodedSignature, timestamp, c.sharedAccessKeyName, encodedURI)
 	}
+
+	return fmt.Sprintf("SharedAccessSignature sig=%s&se=%d&sr=%s", encodedSignature, timestamp, encodedURI)
 }
 
-// ShadowRequest is a simple structure representing a Aws Shadow Update Request
-type ShadowRequest struct {
-	State *ShadowState `json:"state"`
-}
+func (c *IotHubHTTPClient) performRequest(method string, uri string, data string) (string, string) {
+	token := c.buildSasToken(uri)
+	//log.("%s https://%s\n", method, uri)
+	//log.Printf(data)
+	req, _ := http.NewRequest(method, "https://"+uri, bytes.NewBufferString(data))
 
-// ShadowState is the state to be updated
-type ShadowState struct {
-	Desired  map[string]string `json:"desired,omitempty"`
-	Reported map[string]string `json:"reported,omitempty"`
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "golang-iot-client")
+	req.Header.Set("Authorization", token)
+
+	//log.Println("Authorization:", token)
+
+	if method == "DELETE" {
+		req.Header.Set("If-Match", "*")
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		log.Error(err)
+	}
+
+	// read the entire reply to ensure connection re-use
+	text, _ := ioutil.ReadAll(resp.Body)
+
+	io.Copy(ioutil.Discard, resp.Body)
+	defer resp.Body.Close()
+
+	return string(text), resp.Status
 }
